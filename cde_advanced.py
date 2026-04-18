@@ -1,115 +1,133 @@
-import torch
-import torchcde
-import numpy as np
+"""
+cde_advanced.py – Batched Neural CDE for longitudinal ADAS13 prediction.
+Reads fm_embeddings + yolo_embeddings + targets/times/rids from DATA dir.
+Outputs:
+  • cde_longitudinal.png  – predicted vs true trajectories (val patients)
+  • cde_loss_curve.png    – training loss over epochs
+"""
+
+import torch, torchcde, numpy as np, json, os
+import matplotlib
+matplotlib.use("Agg")
 import matplotlib.pyplot as plt
-import json
 
-fm_embs = np.load('adni_data_v2/fm_embeddings.npy')
-yolo_embs = np.load('adni_data_v2/yolo_embeddings.npy')
-targets = np.load('adni_data_v2/targets.npy')
-times = np.load('adni_data_v2/times.npy')
-rids = np.load('adni_data_v2/rids.npy')
+DATA = os.environ.get("DATA_DIR", "adni_data")
+EPOCHS = int(os.environ.get("CDE_EPOCHS", "80"))
 
-with open('adni_data_v2/splits.json', 'r') as f:
+# ── load data ────────────────────────────────────────────────────────────
+fm = np.load(f"{DATA}/fm_embeddings.npy")
+yolo = np.load(f"{DATA}/yolo_embeddings.npy")
+targets = np.load(f"{DATA}/targets.npy")
+times = np.load(f"{DATA}/times.npy")
+rids = np.load(f"{DATA}/rids.npy")
+with open(f"{DATA}/splits.json") as f:
     splits = json.load(f)
-train_rids = splits.get('train_rids', [])
+train_rids = set(splits.get("train_rids", []))
 
-features = np.concatenate([fm_embs, yolo_embs], axis=1) 
+features = np.concatenate([fm, yolo], axis=1)
+INPUT_CH = features.shape[1] + 1  # +1 for time channel
 
-unique_rids = np.unique(rids)
-patient_seqs = {}
-for rid in unique_rids:
-    idx = rids == rid
-    t = times[idx]
-    
-    sorted_idx = np.argsort(t)
-    t = t[sorted_idx]
-    
-    t_clean = []
-    f_clean = []
-    y_clean = []
-    last_t = -1
+# ── build per-patient sequences ──────────────────────────────────────────
+patient_seqs: dict = {}
+for rid in np.unique(rids):
+    mask = rids == rid
+    t = times[mask]; order = np.argsort(t)
+    t = t[order]; feat = features[mask][order]; tgt = targets[mask][order]
+    # enforce strictly increasing times
+    t_clean, f_clean, y_clean = [], [], []
+    last = -1.0
     for i in range(len(t)):
-        if t[i] > last_t:
-            t_clean.append(t[i])
-            f_clean.append(features[idx][sorted_idx][i])
-            y_clean.append(targets[idx][sorted_idx][i])
-            last_t = t[i]
-        else:
-            t_clean.append(last_t + 0.5)
-            f_clean.append(features[idx][sorted_idx][i])
-            y_clean.append(targets[idx][sorted_idx][i])
-            last_t += 0.5
-            
-    patient_seqs[rid] = {
-        'times': torch.tensor(t_clean).float(),
-        'features': torch.tensor(np.array(f_clean)).float(),
-        'targets': torch.tensor(np.array(y_clean)).float()
+        ti = t[i] if t[i] > last else last + 0.5
+        t_clean.append(ti); f_clean.append(feat[i]); y_clean.append(tgt[i])
+        last = ti
+    patient_seqs[int(rid)] = {
+        "t": torch.tensor(t_clean, dtype=torch.float32),
+        "f": torch.tensor(np.array(f_clean), dtype=torch.float32),
+        "y": torch.tensor(np.array(y_clean), dtype=torch.float32),
     }
 
-class NeuralCDE(torch.nn.Module):
-    def __init__(self, input_channels, hidden_channels, output_channels):
+# ── model ────────────────────────────────────────────────────────────────
+class CDEFunc(torch.nn.Module):
+    def __init__(self, h, ic):
         super().__init__()
-        self.func = torch.nn.Linear(hidden_channels, hidden_channels * input_channels)
-        self.initial = torch.nn.Linear(input_channels, hidden_channels)
-        self.readout = torch.nn.Linear(hidden_channels, output_channels)
-        self.input_channels = input_channels
-        self.hidden_channels = hidden_channels
+        self.net = torch.nn.Sequential(
+            torch.nn.Linear(h, 128), torch.nn.Tanh(),
+            torch.nn.Linear(128, h * ic),
+        )
+        self.h, self.ic = h, ic
+    def forward(self, t, z):
+        return self.net(z).view(z.size(0), self.h, self.ic)
 
-    def forward(self, x_cde):
-        z0 = self.initial(x_cde.evaluate(x_cde.interval[0]))
-        class F(torch.nn.Module):
-            def __init__(self, func, input_channels, hidden_channels):
-                super().__init__()
-                self.func = func
-                self.input_channels, self.hidden_channels = input_channels, hidden_channels
-            def forward(self, t, z):
-                return self.func(z).view(z.size(0), self.hidden_channels, self.input_channels)
-        z_t = torchcde.cdeint(X=x_cde, z0=z0, func=F(self.func, self.input_channels, self.hidden_channels), t=x_cde.grid_points, method='euler', options={'step_size': 0.5})
-        return self.readout(z_t)
+class NeuralCDE(torch.nn.Module):
+    def __init__(self, ic, h, oc):
+        super().__init__()
+        self.initial = torch.nn.Linear(ic, h)
+        self.func = CDEFunc(h, ic)
+        self.readout = torch.nn.Linear(h, oc)
+    def forward(self, X_cde):
+        z0 = self.initial(X_cde.evaluate(X_cde.interval[0]))
+        z = torchcde.cdeint(X=X_cde, z0=z0, func=self.func,
+                            t=X_cde.grid_points, method="euler",
+                            options={"step_size": 0.5})
+        return self.readout(z)
 
-model = NeuralCDE(input_channels=97, hidden_channels=32, output_channels=1)
-optimizer = torch.optim.Adam(model.parameters(), lr=0.005)
+model = NeuralCDE(ic=INPUT_CH, h=64, oc=1)
+opt = torch.optim.Adam(model.parameters(), lr=3e-3)
+sched = torch.optim.lr_scheduler.StepLR(opt, step_size=max(1, EPOCHS // 3), gamma=0.5)
 
-print("Training Batched Longitudinal Neural CDE...")
-for epoch in range(50):
-    total_loss = 0
+# ── train ────────────────────────────────────────────────────────────────
+loss_hist = []
+print(f"[CDE] Training for {EPOCHS} epochs on {sum(1 for r in patient_seqs if r in train_rids)} train patients …")
+for ep in range(EPOCHS):
+    model.train(); ep_loss = 0.0; n = 0
     for rid, seq in patient_seqs.items():
-        if int(rid) not in train_rids: continue
-        if len(seq['times']) < 2: continue
-        X = torch.cat([seq['times'].unsqueeze(-1), seq['features']], dim=1).unsqueeze(0)
+        if rid not in train_rids or len(seq["t"]) < 2:
+            continue
+        X = torch.cat([seq["t"].unsqueeze(-1), seq["f"]], dim=1).unsqueeze(0)
         coeffs = torchcde.hermite_cubic_coefficients_with_backward_differences(X)
         X_cde = torchcde.CubicSpline(coeffs)
-        
         pred = model(X_cde)
-        y = seq['targets'].unsqueeze(0).unsqueeze(-1)
+        y = seq["y"].unsqueeze(0).unsqueeze(-1)
         loss = torch.nn.functional.mse_loss(pred, y)
-        optimizer.zero_grad()
-        loss.backward()
-        optimizer.step()
-        total_loss += loss.item()
+        opt.zero_grad(); loss.backward(); opt.step()
+        ep_loss += loss.item(); n += 1
+    sched.step()
+    avg = ep_loss / max(n, 1)
+    loss_hist.append(avg)
+    if (ep + 1) % max(1, EPOCHS // 10) == 0:
+        print(f"  epoch {ep+1:4d}/{EPOCHS}  loss={avg:.4f}")
 
-plt.figure(figsize=(12, 7))
-colors = plt.cm.tab10(np.linspace(0, 1, 10))
-c_idx = 0
+# ── graphs ───────────────────────────────────────────────────────────────
+# 1) loss curve
+plt.figure(figsize=(8, 4))
+plt.plot(loss_hist, linewidth=1.5, color="teal")
+plt.xlabel("Epoch"); plt.ylabel("MSE Loss"); plt.title("Neural CDE – Training Loss")
+plt.grid(True, alpha=0.3); plt.tight_layout()
+plt.savefig(f"{DATA}/cde_loss_curve.png", dpi=150); plt.close()
+
+# 2) trajectory predictions (val patients)
+model.eval()
+fig, ax = plt.subplots(figsize=(12, 7))
+colors = plt.cm.Set1(np.linspace(0, 1, 10))
+ci = 0
 for rid, seq in patient_seqs.items():
-    if int(rid) in train_rids or len(seq['times']) < 2: continue
-    X = torch.cat([seq['times'].unsqueeze(-1), seq['features']], dim=1).unsqueeze(0)
+    if rid in train_rids or len(seq["t"]) < 2:
+        continue
+    X = torch.cat([seq["t"].unsqueeze(-1), seq["f"]], dim=1).unsqueeze(0)
     coeffs = torchcde.hermite_cubic_coefficients_with_backward_differences(X)
     X_cde = torchcde.CubicSpline(coeffs)
-    pred_np = model(X_cde).detach().numpy()[0, :, 0]
-    t = seq['times'].numpy()
-    y = seq['targets'].numpy()
-    
-    plt.plot(t, y, label=f'True RID {int(rid)}' if c_idx < 3 else "", color=colors[c_idx%10], marker='o')
-    plt.plot(t, pred_np, label=f'Pred RID {int(rid)}' if c_idx < 3 else "", color=colors[c_idx%10], marker='x', linestyle='--')
-    c_idx += 1
-    if c_idx > 4: break
-
-plt.xlabel('Months since baseline')
-plt.ylabel('ADAS13 Cognitive Score')
-plt.title('Independent Patient Trajectories: CDE Advanced Validation')
-plt.legend()
-plt.grid(True)
-plt.savefig('adni_data_v2/cde_longitudinal.png')
-print("Completed CDE evaluation!")
+    with torch.no_grad():
+        pred_np = model(X_cde).numpy()[0, :, 0]
+    t_np = seq["t"].numpy(); y_np = seq["y"].numpy()
+    ax.plot(t_np, y_np, "o-", color=colors[ci % 10], label=f"True RID {rid}", linewidth=2)
+    ax.plot(t_np, pred_np, "x--", color=colors[ci % 10], label=f"Pred RID {rid}", linewidth=1.5)
+    ci += 1
+    if ci >= 5:
+        break
+ax.set_xlabel("Months since baseline"); ax.set_ylabel("ADAS13")
+ax.set_title("Neural CDE – Predicted vs True Patient Trajectories (Validation)")
+if ci > 0:
+    ax.legend(fontsize=8)
+ax.grid(True, alpha=0.3); plt.tight_layout()
+plt.savefig(f"{DATA}/cde_longitudinal.png", dpi=150); plt.close()
+print("[CDE] Done.")
