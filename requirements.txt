@@ -1,0 +1,11 @@
+torch>=2.1
+torchvision
+torchcde>=0.2.5
+ultralytics>=8.1
+numpy<2.0
+pandas
+boto3
+opencv-python-headless
+matplotlib
+scikit-learn
+tqdm
